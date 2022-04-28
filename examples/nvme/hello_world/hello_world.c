@@ -53,7 +53,9 @@ struct ns_entry {
 	struct spdk_nvme_qpair	*qpair;
 };
 
+// 存放所有 ctrlr_entry 的链表头
 static TAILQ_HEAD(, ctrlr_entry) g_controllers = TAILQ_HEAD_INITIALIZER(g_controllers);
+// 存放所有 namespace 的链表头
 static TAILQ_HEAD(, ns_entry) g_namespaces = TAILQ_HEAD_INITIALIZER(g_namespaces);
 static struct spdk_nvme_transport_id g_trid = {};
 
@@ -85,6 +87,7 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 struct hello_world_sequence {
 	struct ns_entry	*ns_entry;
 	char		*buf;
+	// 是否 using controller memory buffer for IO
 	unsigned        using_cmb_io;
 	int		is_completed;
 };
@@ -136,6 +139,8 @@ write_complete(void *arg, const struct spdk_nvme_cpl *completion)
 		sequence->is_completed = 2;
 		exit(1);
 	}
+	// 成功的时候没有任何输出
+	spdk_nvme_qpair_print_completion(sequence->ns_entry->qpair, (struct spdk_nvme_cpl *)completion);
 	/*
 	 * The write I/O has completed.  Free the buffer associated with
 	 *  the write I/O and allocate a new zeroed buffer for reading
@@ -181,6 +186,7 @@ reset_zone_complete(void *arg, const struct spdk_nvme_cpl *completion)
 static void
 reset_zone_and_wait_for_completion(struct hello_world_sequence *sequence)
 {
+	// 提交IO操作
 	if (spdk_nvme_zns_reset_zone(sequence->ns_entry->ns, sequence->ns_entry->qpair,
 				     0, /* starting LBA of the zone to reset */
 				     false, /* don't reset all zones */
@@ -190,6 +196,7 @@ reset_zone_and_wait_for_completion(struct hello_world_sequence *sequence)
 		exit(1);
 	}
 	while (!sequence->is_completed) {
+		// 轮询操作完成
 		spdk_nvme_qpair_process_completions(sequence->ns_entry->qpair, 0);
 	}
 	sequence->is_completed = 0;
@@ -209,13 +216,16 @@ hello_world(void)
 		 *  to namespaces on the controller.  NVMe controllers typically support
 		 *  many qpairs per controller.  Any I/O qpair allocated for a controller
 		 *  can submit I/O to any namespace on that controller.
+		 * 为控制器分配的任何 I/O qpair 都可以将 I/O 提交到该控制器上的任何命名空间。
 		 *
 		 * The SPDK NVMe driver provides no synchronization for qpair accesses -
 		 *  the application must ensure only a single thread submits I/O to a
 		 *  qpair, and that same thread must also check for completions on that
 		 *  qpair.  This enables extremely efficient I/O processing by making all
 		 *  I/O operations completely lockless.
+		 * 不提供任何qp同步，因此一个qp只能单个线程使用
 		 */
+		// 3.1 分配qp
 		ns_entry->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns_entry->ctrlr, NULL, 0);
 		if (ns_entry->qpair == NULL) {
 			printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair() failed\n");
@@ -226,6 +236,7 @@ hello_world(void)
 		 * Use spdk_dma_zmalloc to allocate a 4KB zeroed buffer.  This memory
 		 * will be pinned, which is required for data buffers used for SPDK NVMe
 		 * I/O operations.
+		 * 3.2 分配一个4KB的页并pin，用于SPDK的I/O操作
 		 */
 		sequence.using_cmb_io = 1;
 		sequence.buf = spdk_nvme_ctrlr_map_cmb(ns_entry->ctrlr, &sz);
@@ -269,6 +280,9 @@ hello_world(void)
 		 *  This allows users to potentially specify different completion
 		 *  callback routines for each I/O, as well as pass a unique handle
 		 *  as an argument so the application knows which I/O has completed.
+		 * write_complete（） 将在写入 I/O 完成时以 &sequence 的 * 值作为参数进行调用。
+		 * 这允许用户为每个 I/O 指定不同的完成 * 回调例程，以及传递一个唯一的句柄 * 作为参数，
+		 * 以便应用程序知道哪个 I/O 已完成。
 		 *
 		 * Note that the SPDK NVMe driver will only check for completions
 		 *  when the application calls spdk_nvme_qpair_process_completions().
@@ -324,6 +338,11 @@ static void
 attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
 {
+	printf("spdk_nvme_ctrlr_opts default:\n");
+	printf("\tnum_io_queues:%u\n", opts->num_io_queues);
+	printf("\tuse_cmb_sqs:%u\n", opts->use_cmb_sqs);
+	printf("\tio_queue_size:%u\n", opts->io_queue_size);
+	printf("\tio_queue_requests:%u\n", opts->io_queue_requests);
 	int nsid;
 	struct ctrlr_entry *entry;
 	struct spdk_nvme_ns *ns;
@@ -336,6 +355,13 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	}
 
 	printf("Attached to %s\n", trid->traddr);
+	printf("\ttrstring: %s\n", trid->trstring);
+	printf("\ttrtype: %d\n", trid->trtype);
+	printf("\tadrfam: 0x%x\n", trid->adrfam);
+	printf("\ttraddr: %s\n", trid->traddr);
+	printf("\ttrsvcid: %s\n", trid->trsvcid);
+	printf("\tsubnqn: %s\n", trid->subnqn);
+	printf("\tpriority: %d\n", trid->priority);
 
 	/*
 	 * spdk_nvme_ctrlr is the logical abstraction in SPDK for an NVMe
@@ -347,7 +373,9 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 */
 	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
 
+	// printf("%*.*s\n",m,n,ch); 前边的*定义的是总的宽度，后边的*定义的是输出的个数。分别对应外面的参数m和n
 	snprintf(entry->name, sizeof(entry->name), "%-20.20s (%-20.20s)", cdata->mn, cdata->sn);
+	printf("entry->name: %s\n", entry->name);
 
 	entry->ctrlr = ctrlr;
 	TAILQ_INSERT_TAIL(&g_controllers, entry, link);
@@ -362,6 +390,7 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 */
 	for (nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr); nsid != 0;
 	     nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, nsid)) {
+		// 获取命名空间
 		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
 		if (ns == NULL) {
 			continue;
@@ -384,11 +413,13 @@ cleanup(void)
 
 	TAILQ_FOREACH_SAFE(ctrlr_entry, &g_controllers, link, tmp_ctrlr_entry) {
 		TAILQ_REMOVE(&g_controllers, ctrlr_entry, link);
+		// 分离nvme设备
 		spdk_nvme_detach_async(ctrlr_entry->ctrlr, &detach_ctx);
 		free(ctrlr_entry);
 	}
 
 	if (detach_ctx) {
+		// 轮询设备分离完成
 		spdk_nvme_detach_poll(detach_ctx);
 	}
 }
@@ -416,6 +447,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 {
 	int op, rc;
 
+	// 填充传输类型和字符串
 	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
 	snprintf(g_trid.subnqn, sizeof(g_trid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
 
@@ -469,6 +501,9 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 
 int main(int argc, char **argv)
 {
+	spdk_log_set_print_level(2);
+	spdk_log_set_level(2);
+	printf("----g_spdk_log_print_level: [%d], g_spdk_log_level: [%d]\n", spdk_log_get_print_level(), spdk_log_get_level());
 	int rc;
 	struct spdk_env_opts opts;
 
@@ -476,6 +511,7 @@ int main(int argc, char **argv)
 	 * SPDK relies on an abstraction around the local environment
 	 * named env that handles memory allocation and PCI device operations.
 	 * This library must be initialized first.
+	 * 1. 先初始化环境 struct spdk_env_opts opts;
 	 *
 	 */
 	spdk_env_opts_init(&opts);
@@ -503,6 +539,7 @@ int main(int argc, char **argv)
 	 *  whether to attach to each controller.  attach_cb will then be
 	 *  called for each controller after the SPDK NVMe driver has completed
 	 *  initializing the controller we chose to attach.
+	 * 2. 探测并连接设备
 	 */
 	rc = spdk_nvme_probe(&g_trid, NULL, probe_cb, attach_cb, NULL);
 	if (rc != 0) {
@@ -518,6 +555,7 @@ int main(int argc, char **argv)
 	}
 
 	printf("Initialization complete.\n");
+	// 3. 执行与设备相关的读写操作
 	hello_world();
 	cleanup();
 	if (g_vmd) {
@@ -525,7 +563,12 @@ int main(int argc, char **argv)
 	}
 
 exit:
+	// 4. 释放attach设备时的相关资源
 	cleanup();
+	// 5. 释放环境资源
+	// 释放环境库中spdk_env_init（）分配的任何资源。
+	// 此调用后，不得进行 SPDK env 函数调用。
+	// 预计此函数的常见用法是在终止进程之前或在同一进程中重新初始化环境库之前调用它。
 	spdk_env_fini();
 	return rc;
 }

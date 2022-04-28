@@ -80,6 +80,7 @@ enum entry_type {
 struct ns_fn_table;
 
 struct ns_entry {
+	// 根据不同的类型，配置不同的ns_fn_table
 	enum entry_type		type;
 	const struct ns_fn_table	*fn_table;
 
@@ -101,16 +102,23 @@ struct ns_entry {
 	} u;
 
 	TAILQ_ENTRY(ns_entry)	link;
+	// g_io_size_bytes / sector_size，一个io包含的sector个数
 	uint32_t		io_size_blocks;
+	// 应该是用来配置一个qp的request num，默认是g_queue_depth * entrie，即用户指定队列深度的三倍
 	uint32_t		num_io_requests;
+	// ns_size / g_io_size_bytes，该命名空间大小能支持的操作个数
 	uint64_t		size_in_ios;
+	// 一个扇区的大小（不包括元数据）
 	uint32_t		block_size;
+	// 元数据大小
 	uint32_t		md_size;
+	// 是否支持extend lba
 	bool			md_interleave;
 	unsigned int		seed;
 	struct spdk_zipf	*zipf;
-	bool			pi_loc;
+	bool			pi_loc;  // 保护信息是否在元数据的开头？
 	enum spdk_nvme_pi_type	pi_type;
+	// PI相关的flag
 	uint32_t		io_flags;
 	char			name[1024];
 };
@@ -135,31 +143,45 @@ static const double g_latency_cutoffs[] = {
 };
 
 struct ns_worker_stats {
+	// 完成的IO个数
 	uint64_t		io_completed;
+	// 上一个检查点完成的IO个数
 	uint64_t		last_io_completed;
+	// 总时间（逐个计算相加的）
 	uint64_t		total_tsc;
+	// 最小时延
 	uint64_t		min_tsc;
+	// 最大时延
 	uint64_t		max_tsc;
+	// 上一次检查的时间
 	uint64_t		last_tsc;
+	// 繁忙的总时间
 	uint64_t		busy_tsc;
+	// 空闲的总时间
 	uint64_t		idle_tsc;
+	// 上一个检查点时繁忙的总时间
 	uint64_t		last_busy_tsc;
+	// 上一个检查点时空闲的总时间
 	uint64_t		last_idle_tsc;
 };
 
 struct ns_worker_ctx {
 	struct ns_entry		*entry;
 	struct ns_worker_stats	stats;
+	// 即已提交IO的个数（未完成）
 	uint64_t		current_queue_depth;
+	// 当前IO的次数（顺序）（offset_in_ios*IO块大小 即等于 LBA）
 	uint64_t		offset_in_ios;
+	// 被热插拔去掉了
 	bool			is_draining;
 
 	union {
 		struct {
 			int				num_active_qpairs;
 			int				num_all_qpairs;
-			struct spdk_nvme_qpair		**qpair;
+			struct spdk_nvme_qpair		**qpair;  // qp数组
 			struct spdk_nvme_poll_group	*group;
+			// 下一次IO将要使用的QP的索引， 轮询的方式
 			int				last_qpair;
 		} nvme;
 
@@ -185,13 +207,17 @@ struct ns_worker_ctx {
 	struct spdk_histogram_data	*histogram;
 };
 
+// 一个IO对应这样一个结构体
 struct perf_task {
 	struct ns_worker_ctx	*ns_ctx;
+	// 按照 g_io_unit_size 单元分割的输入数据区间缓冲
 	struct iovec		*iovs; /* array of iovecs to transfer. */
 	int			iovcnt; /* Number of iovecs in iovs array. */
-	int			iovpos; /* Current iovec position. */
-	uint32_t		iov_offset; /* Offset in current iovec. */
+	int			iovpos; /* Current iovec position. 这是区间索引 */
+	uint32_t		iov_offset; /* Offset in current iovec. 偏移，按字节*/
+	// 元数据iov
 	struct iovec		md_iov;
+	// 任务提交时的cycle
 	uint64_t		submit_tsc;
 	bool			is_read;
 	struct spdk_dif_ctx	dif_ctx;
@@ -201,7 +227,7 @@ struct perf_task {
 };
 
 struct worker_thread {
-	TAILQ_HEAD(, ns_worker_ctx)	ns_ctx;
+	TAILQ_HEAD(, ns_worker_ctx)	ns_ctx;  // 一个线程可能需要执行多个命名空间的工作
 	TAILQ_ENTRY(worker_thread)	link;
 	unsigned			lcore;
 };
@@ -233,29 +259,38 @@ static bool g_vmd;
 static const char *g_workload_type;
 static TAILQ_HEAD(, ctrlr_entry) g_controllers = TAILQ_HEAD_INITIALIZER(g_controllers);
 static TAILQ_HEAD(, ns_entry) g_namespaces = TAILQ_HEAD_INITIALIZER(g_namespaces);
+// 命名空间的个数
 static int g_num_namespaces;
+// 全局的struct worker_thread链表头部
 static TAILQ_HEAD(, worker_thread) g_workers = TAILQ_HEAD_INITIALIZER(g_workers);
+// 工作的线程数
 static int g_num_workers = 0;
 static uint32_t g_main_core;
 static pthread_barrier_t g_worker_sync_barrier;
 
+// 每秒多少tick
 static uint64_t g_tsc_rate;
 
 static bool g_monitor_perf_cores = false;
 
+// 分配内存时的对齐地址
 static uint32_t g_io_align = 0x200;
 static bool g_io_align_specified;
+// 用户指定的io大小
 static uint32_t g_io_size_bytes;
+// 单个扇区的元数据大小
 static uint32_t g_max_io_md_size;
+// 一次IO包含的扇区个数
 static uint32_t g_max_io_size_blocks;
 static uint32_t g_metacfg_pract_flag;
 static uint32_t g_metacfg_prchk_flags;
 static int g_rw_percentage = -1;
 static int g_is_random;
-static int g_queue_depth;
+static int g_queue_depth;  // 用户指定的队列深度
 static int g_nr_io_queues_per_ns = 1;
 static int g_nr_unused_io_queues;
 static int g_time_in_sec;
+// 整个测试运行的总时间 s
 static uint64_t g_elapsed_time_in_usec;
 static int g_warmup_time_in_sec;
 static uint32_t g_max_completions;
@@ -270,10 +305,12 @@ static bool g_mix_specified;
 static bool g_exit;
 /* Default to 10 seconds for the keep alive value. This value is arbitrary. */
 static uint32_t g_keep_alive_timeout_in_ms = 10000;
+// 用于控制错误信息打印的频率，即每g_quiet_count个错误消息打印一次错误信息
 static uint32_t g_quiet_count = 1;
 static double g_zipf_theta;
 /* Set default io_queue_size to UINT16_MAX, NVMe driver will then reduce this
  * to MQES to maximize the io_queue_size as much as possible.
+ * 默认是设备支持的最大值
  */
 static uint32_t g_io_queue_size = UINT16_MAX;
 
@@ -300,6 +337,7 @@ static uint32_t g_io_queue_size = UINT16_MAX;
 	}
 
 static bool g_dump_transport_stats;
+// 线程间互斥打印transport_stats
 static pthread_mutex_t g_stats_mutex;
 
 #define MAX_ALLOWED_PCI_DEVICE_NUM 128
@@ -312,6 +350,7 @@ struct trid_entry {
 	TAILQ_ENTRY(trid_entry)		tailq;
 };
 
+// trid 头部，可以指定多个trid
 static TAILQ_HEAD(, trid_entry) g_trid_list = TAILQ_HEAD_INITIALIZER(g_trid_list);
 
 static int g_file_optind; /* Index of first filename in argv */
@@ -380,7 +419,7 @@ nvme_perf_next_sge(void *ref, void **address, uint32_t *length)
 	assert(task->iov_offset <= iov->iov_len);
 
 	*address = iov->iov_base + task->iov_offset;
-	*length = iov->iov_len - task->iov_offset;
+	*length = iov->iov_len - task->iov_offset; // 这有可能是0啊
 	task->iovpos++;
 	task->iov_offset = 0;
 
@@ -395,6 +434,7 @@ nvme_perf_allocate_iovs(struct perf_task *task, void *buf, uint32_t length)
 	uint32_t offset = 0;
 
 	task->iovcnt = SPDK_CEIL_DIV(length, (uint64_t)g_io_unit_size);
+	// printf("g_io_unit_size: %u\n", g_io_unit_size);
 	task->iovs = calloc(task->iovcnt, sizeof(struct iovec));
 	if (!task->iovs) {
 		return -1;
@@ -402,6 +442,7 @@ nvme_perf_allocate_iovs(struct perf_task *task, void *buf, uint32_t length)
 
 	while (length > 0) {
 		iov = &task->iovs[iovpos];
+		// 不指定g_io_unit_size的情况下，io大小相当于等于length
 		iov->iov_len = spdk_min(length, g_io_unit_size);
 		iov->iov_base = buf + offset;
 		length -= iov->iov_len;
@@ -782,6 +823,7 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 	}
 	memset(buf, pattern, max_io_size_bytes);
 
+	// 根据传输单元大小，会将IO划分成多个区间
 	rc = nvme_perf_allocate_iovs(task, buf, max_io_size_bytes);
 	if (rc < 0) {
 		fprintf(stderr, "perf task failed to allocate iovs\n");
@@ -802,6 +844,8 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 	}
 }
 
+// 提交单个IO
+// offset_in_ios LBA 号
 static int
 nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 	       struct ns_entry *entry, uint64_t offset_in_ios)
@@ -833,6 +877,7 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 	}
 
 	if (mode != DIF_MODE_NONE) {
+		// 先不管，当前我们的设备不支持
 		rc = spdk_dif_ctx_init(&task->dif_ctx, entry->block_size, entry->md_size,
 				       entry->md_interleave, entry->pi_loc,
 				       (enum spdk_dif_type)entry->pi_type, entry->io_flags,
@@ -904,6 +949,7 @@ perf_disconnect_cb(struct spdk_nvme_qpair *qpair, void *ctx)
 
 }
 
+// 检查IO完成
 static int64_t
 nvme_check_io(struct ns_worker_ctx *ns_ctx)
 {
@@ -1214,13 +1260,15 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &opts, sizeof(opts));
 	/* NVMe driver may add additional entries based on
 	 * stripe size and maximum transfer size, we assume
-	 * 1 more entry be used for stripe.
+	 * 1 more entry be used for stripe. 假设额外需要一个entry用于条带
 	 */
 	entries = (g_io_size_bytes - 1) / max_xfer_size + 2;
+	printf("g_queue_depth: %d, entries: %u, opts.io_queue_size(支持的最大队列大小): %u\n",
+		g_queue_depth, entries, opts.io_queue_size);
 	if ((g_queue_depth * entries) > opts.io_queue_size) {
-		printf("controller IO queue size %u less than required\n",
+		printf("WARNING: controller IO queue size %u less than required\n",
 		       opts.io_queue_size);
-		printf("Consider using lower queue depth or small IO size because "
+		printf("WARNING: Consider using lower queue depth or small IO size because "
 		       "IO requests may be queued at the NVMe driver.\n");
 	}
 	/* For requests which have children requests, parent request itself
@@ -1252,13 +1300,24 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	entry->md_interleave = spdk_nvme_ns_supports_extended_lba(ns);
 	entry->pi_loc = spdk_nvme_ns_get_data(ns)->dps.md_start;
 	entry->pi_type = spdk_nvme_ns_get_pi_type(ns);
+	printf("命名空间[%d] Controller PA(%s) %-20.20s (%-20.20s) 属性：\n"
+		"\tns_size: %0.2f GB\n\tsector_size: [%u B]\n\tmax_xfer_size: [%0.2f KB]\n",
+		spdk_nvme_ns_get_id(ns), spdk_nvme_ctrlr_get_transport_id(ctrlr)->traddr,
+		cdata->mn, cdata->sn, 1.0 * ns_size/1024/1024/1024, sector_size, max_xfer_size/1024.0);
+	printf("\textended_sector_size: %u\n", spdk_nvme_ns_get_extended_sector_size(ns));
+	printf("\tmd_size: %u\n", spdk_nvme_ns_get_md_size(ns));
+	printf("\tsupports_extended_lba: %s\n", spdk_nvme_ns_supports_extended_lba(ns) ? "true" : "false");
 
 	if (spdk_nvme_ns_get_flags(ns) & SPDK_NVME_NS_DPS_PI_SUPPORTED) {
+		printf("[硬件特性]：设备【支持】数据端到端保护\n");
 		entry->io_flags = g_metacfg_pract_flag | g_metacfg_prchk_flags;
+	} else {
+		printf("[硬件特性]：设备【不支持】数据端到端保护\n");
 	}
 
 	/* If metadata size = 8 bytes, PI is stripped (read) or inserted (write),
-	 *  and so reduce metadata size from block size.  (If metadata size > 8 bytes,
+	 *  and so reduce metadata size from block size（从块数据中减去元数据大小）.
+	 * (If metadata size > 8 bytes,
 	 *  PI is passed (read) or replaced (write).  So block size is not necessary
 	 *  to change.)
 	 */
@@ -1281,6 +1340,7 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	if (g_max_io_size_blocks < entry->io_size_blocks) {
 		g_max_io_size_blocks = entry->io_size_blocks;
 	}
+	printf("[for perf] g_max_io_md_size: %u, g_max_io_size_blocks(每次io最大的扇区数): %u\n", g_max_io_md_size, g_max_io_size_blocks);
 
 	build_nvme_ns_name(entry->name, sizeof(entry->name), ctrlr, spdk_nvme_ns_get_id(ns));
 
@@ -1371,6 +1431,7 @@ register_ctrlr(struct spdk_nvme_ctrlr *ctrlr, struct trid_entry *trid_entry)
 			if (ns == NULL) {
 				continue;
 			}
+			// 注册所有的ns，并准备io相关的参数
 			register_ns(ctrlr, ns);
 		}
 	} else {
@@ -1384,6 +1445,7 @@ register_ctrlr(struct spdk_nvme_ctrlr *ctrlr, struct trid_entry *trid_entry)
 	}
 }
 
+// 提交一个IO任何
 static inline void
 submit_single_io(struct perf_task *task)
 {
@@ -1425,6 +1487,7 @@ submit_single_io(struct perf_task *task)
 	}
 }
 
+// 回调中又发起新请求，所以task只会被分配用户指定队列深度那么多个
 static inline void
 task_complete(struct perf_task *task)
 {
@@ -1492,6 +1555,7 @@ io_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
 	task_complete(task);
 }
 
+// 分配单个IO的task
 static struct perf_task *
 allocate_task(struct ns_worker_ctx *ns_ctx, int queue_depth)
 {
@@ -1503,6 +1567,8 @@ allocate_task(struct ns_worker_ctx *ns_ctx, int queue_depth)
 		exit(1);
 	}
 
+	// 设置单个IO的参数
+	// queue_depth % 8 + 1是输入的数据
 	ns_ctx->entry->fn_table->setup_payload(task, queue_depth % 8 + 1);
 
 	task->ns_ctx = ns_ctx;
@@ -1510,6 +1576,7 @@ allocate_task(struct ns_worker_ctx *ns_ctx, int queue_depth)
 	return task;
 }
 
+// 提交queue_depth个IO任务
 static void
 submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
 {
@@ -1545,13 +1612,15 @@ print_periodic_performance(bool warmup)
 	uint64_t core_busy_tsc = 0;
 	uint64_t core_idle_tsc = 0;
 	double core_busy_perc = 0;
-
 	if (!isatty(STDOUT_FILENO)) {
+		// fprintf(stderr, "isatty coresd: %u\n\n", spdk_env_get_current_core());
 		/* Don't print periodic stats if output is not going
-		 * to a terminal.
+		 * to a terminal. 只有主线程定期打印性能信息
 		 */
 		return;
 	}
+	// 只有主线程打印，并将所有worker(子线程)的工作信息相加
+	// 这个时间间隔完成的IO个数
 	io_this_second = 0;
 	TAILQ_FOREACH(worker, &g_workers, link) {
 		busy_tsc = 0;
@@ -1572,6 +1641,7 @@ print_periodic_performance(bool warmup)
 			core_idle_tsc += idle_tsc;
 		}
 	}
+	// 带宽
 	mb_this_second = (double)io_this_second * g_io_size_bytes / (1024 * 1024);
 
 	printf("%s%9ju IOPS, %8.2f MiB/s", warmup ? "[warmup] " : "", io_this_second, mb_this_second);
@@ -1608,6 +1678,7 @@ work_fn(void *arg)
 	uint64_t check_now;
 
 	/* Allocate queue pairs for each namespace. */
+	// 为每个ns分配qp
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 		if (init_ns_worker_ctx(ns_ctx) != 0) {
 			printf("ERROR: init_ns_worker_ctx() failed\n");
@@ -1635,7 +1706,10 @@ work_fn(void *arg)
 	}
 
 	/* Submit initial I/O for each namespace. */
+	// 每个QP都提交用户指定队列深度那么多个IO
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+		// 自己添加的
+		ns_ctx->stats.last_tsc = spdk_get_ticks();
 		submit_io(ns_ctx, g_queue_depth);
 	}
 
@@ -1649,9 +1723,10 @@ work_fn(void *arg)
 			check_now = spdk_get_ticks();
 			check_rc = ns_ctx->entry->fn_table->check_io(ns_ctx);
 
+			// 空闲还是busy，第一次统计是有问题的
 			if (check_rc > 0) {
 				ns_ctx->stats.busy_tsc += check_now - ns_ctx->stats.last_tsc;
-			} else {
+			} else {  // 没有完成的IO，说明没有执行用户程序，是空闲的
 				ns_ctx->stats.idle_tsc += check_now - ns_ctx->stats.last_tsc;
 			}
 			ns_ctx->stats.last_tsc = check_now;
@@ -1702,6 +1777,7 @@ work_fn(void *arg)
 	}
 
 	/* drain the io of each ns_ctx in round robin to make the fairness */
+	// 可能是因为用户 ctrl+c 提前退出，需要将未完成的io drain
 	do {
 		unfinished_ns_ctx = 0;
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
@@ -2078,6 +2154,7 @@ add_trid(const char *trid_str)
 			free(trid_entry);
 			return 1;
 		}
+		printf("[user] input nsid(命名空间id): %d\n", nsid);
 
 		trid_entry->nsid = (uint16_t)nsid;
 	}
@@ -2579,11 +2656,16 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 	return 0;
 }
 
+// 生成多个 struct worker_thread  插入全局链表
 static int
 register_workers(void)
 {
 	uint32_t i;
 	struct worker_thread *worker;
+
+	printf("env线程信息：\n");
+	printf("\tspdk_env_get_core_count: %u\n", spdk_env_get_core_count());
+	printf("\tspdk_env_get_current_core: %u\n", spdk_env_get_current_core());
 
 	SPDK_ENV_FOREACH_CORE(i) {
 		worker = calloc(1, sizeof(*worker));
@@ -2594,13 +2676,16 @@ register_workers(void)
 
 		TAILQ_INIT(&worker->ns_ctx);
 		worker->lcore = i;
+		printf("worker->lcore: %u\n", worker->lcore);
 		TAILQ_INSERT_TAIL(&g_workers, worker, link);
 		g_num_workers++;
 	}
+	printf("工作线程数g_num_workers: %d\n", g_num_workers);
 
 	return 0;
 }
 
+// 销毁 struct worker_thread， 包括里面的ns_ctx 和histogram
 static void
 unregister_workers(void)
 {
@@ -2648,6 +2733,12 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	opts->data_digest = g_data_digest;
 	opts->keep_alive_timeout_ms = g_keep_alive_timeout_in_ms;
 	memcpy(opts->hostnqn, trid_entry->hostnqn, sizeof(opts->hostnqn));
+	printf("ctrlr的指定配置为：\n");
+	printf("\tio_queue_size: %d\n", opts->io_queue_size);
+	printf("\theader_digest: %s\n", opts->header_digest ? "true" : "false");
+	printf("\tdata_digest: %s\n", opts->data_digest ? "true" : "false");
+	printf("\tkeep_alive_timeout_ms: %u\n", opts->keep_alive_timeout_ms);
+	printf("\thostnqn: %s\n", opts->hostnqn);
 
 	return true;
 }
@@ -2656,6 +2747,12 @@ static void
 attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
 {
+	printf("ctrlr的实际配置为：\n");
+	printf("\tio_queue_size: %d\n", opts->io_queue_size);
+	printf("\theader_digest: %s\n", opts->header_digest ? "true" : "false");
+	printf("\tdata_digest: %s\n", opts->data_digest ? "true" : "false");
+	printf("\tkeep_alive_timeout_ms: %u\n", opts->keep_alive_timeout_ms);
+	printf("\thostnqn: %s\n", opts->hostnqn);
 	struct trid_entry	*trid_entry = cb_ctx;
 	struct spdk_pci_addr	pci_addr;
 	struct spdk_pci_device	*pci_dev;
@@ -2685,6 +2782,7 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	register_ctrlr(ctrlr, trid_entry);
 }
 
+// 注册/创建 NVMe 控制器
 static int
 register_controllers(void)
 {
@@ -2746,6 +2844,7 @@ unregister_controllers(void)
 	}
 }
 
+// 在线程worker和ns之间建立映射
 static int
 associate_workers_with_ns(void)
 {
@@ -2755,7 +2854,8 @@ associate_workers_with_ns(void)
 	int			i, count;
 
 	count = g_num_namespaces > g_num_workers ? g_num_namespaces : g_num_workers;
-
+	// 轮询的方式在线程和ns之间建立映射，
+	// 如线程数是3，ns个数为2，在1、3线程对1ns操作，2线程对2ns操作
 	for (i = 0; i < count; i++) {
 		if (entry == NULL) {
 			break;
@@ -2794,6 +2894,7 @@ nvme_poll_ctrlrs(void *arg)
 	int oldstate;
 	int rc;
 
+	// 取消绑核
 	spdk_unaffinitize_thread();
 
 	while (true) {
@@ -2808,6 +2909,7 @@ nvme_poll_ctrlrs(void *arg)
 			}
 		}
 
+		// 允许线程取消
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &oldstate);
 
 		/* This is a pthread cancellation point and cannot be removed. */
@@ -2846,13 +2948,22 @@ setup_sig_handlers(void)
 	return 0;
 }
 
+// static int
+// my_worker(void *arg) {
+// 	printf("还可以执行: core %d\n", spdk_env_get_current_core());
+// 	return 0;
+// }
+
 int main(int argc, char **argv)
 {
+	spdk_log_set_print_level(2);
+	spdk_log_set_level(2);
 	int rc;
 	struct worker_thread *worker, *main_worker;
 	struct spdk_env_opts opts;
 	pthread_t thread_id = 0;
 
+	// 初始化env选项
 	spdk_env_opts_init(&opts);
 	opts.name = "perf";
 	opts.pci_allowed = g_allowed_pci_addr;
@@ -2867,6 +2978,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Failed to init mutex\n");
 		return -1;
 	}
+	// 这里就已经根据选定的内核掩码创建线程了
+	// 主线程和子线程之间通过pipe通信
 	if (spdk_env_init(&opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
 		unregister_trids();
@@ -2874,14 +2987,19 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
+	// printf("[Finish spdk_env_init] Sleep(5)\n");
+	// sleep(5);
+
 	rc = setup_sig_handlers();
 	if (rc != 0) {
 		rc = -1;
 		goto cleanup;
 	}
 
+	// 每秒多少tick
 	g_tsc_rate = spdk_get_ticks_hz();
 
+	// 生成wort实例
 	if (register_workers() != 0) {
 		rc = -1;
 		goto cleanup;
@@ -2894,6 +3012,7 @@ int main(int argc, char **argv)
 	}
 #endif
 
+	// 注册设备控制器，命名空间，设置IO参数
 	if (register_controllers() != 0) {
 		rc = -1;
 		goto cleanup;
@@ -2913,12 +3032,14 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Error suppression count may not be exact.\n");
 	}
 
+	// 用来轮询设备的管理命令的完成
 	rc = pthread_create(&thread_id, NULL, &nvme_poll_ctrlrs, NULL);
 	if (rc != 0) {
 		fprintf(stderr, "Unable to spawn a thread to poll admin queues.\n");
 		goto cleanup;
 	}
 
+	// worker和ns建立映射
 	if (associate_workers_with_ns() != 0) {
 		rc = -1;
 		goto cleanup;
@@ -2947,12 +3068,14 @@ int main(int argc, char **argv)
 	assert(main_worker != NULL);
 	rc = work_fn(main_worker);
 
+	// 等待所有线程的任务运行完成
 	spdk_env_thread_wait_all();
 
 	print_stats();
+	// printf("[Test Over] Sleep(5)\n");
+	// sleep(5);
 
 	pthread_barrier_destroy(&g_worker_sync_barrier);
-
 cleanup:
 	if (thread_id && pthread_cancel(thread_id) == 0) {
 		pthread_join(thread_id, NULL);
@@ -2962,6 +3085,12 @@ cleanup:
 	unregister_controllers();
 	unregister_workers();
 
+	// uint32_t core_id;
+	// SPDK_ENV_FOREACH_CORE(core_id) {
+	// 	if (core_id != g_main_core) {
+	// 		spdk_env_thread_launch_pinned(core_id, my_worker, NULL);
+	// 	}
+	// }
 	spdk_env_fini();
 
 	pthread_mutex_destroy(&g_stats_mutex);
@@ -2970,5 +3099,13 @@ cleanup:
 		fprintf(stderr, "%s: errors occurred\n", argv[0]);
 	}
 
+	// printf("last:\n");
+	// SPDK_ENV_FOREACH_CORE(core_id) {
+	// 	if (core_id != g_main_core) {
+	// 		spdk_env_thread_launch_pinned(core_id, my_worker, NULL);
+	// 	}
+	// }
+	// sleep(5);
+	// 注意，子线程根本没有主动退出，是随着主线程的退出而退出的。
 	return rc;
 }
