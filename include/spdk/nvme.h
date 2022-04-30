@@ -3386,6 +3386,7 @@ int spdk_nvme_ns_cmd_copy(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair
 
 /**
  * Submit a flush request to the specified NVMe namespace.
+ * flush命令用于将非易失写缓存中的内容持久化。
  *
  * The command is submitted to a qpair allocated by spdk_nvme_ctrlr_alloc_io_qpair().
  * The user must ensure that only one thread submits I/O on a given qpair at any
