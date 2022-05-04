@@ -164,6 +164,84 @@ write_complete(void *arg, const struct spdk_nvme_cpl *completion)
 }
 
 static void
+read_zeros_complete(void *arg, const struct spdk_nvme_cpl *completion)
+{
+	struct hello_world_sequence *sequence = arg;
+
+	/* Assume the I/O was successful */
+	sequence->is_completed = 1;
+	/* See if an error occurred. If so, display information
+	 * about it, and set completion value so that I/O
+	 * caller is aware that an error occurred.
+	 */
+	if (spdk_nvme_cpl_is_error(completion)) {
+		spdk_nvme_qpair_print_completion(sequence->ns_entry->qpair, (struct spdk_nvme_cpl *)completion);
+		fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
+		fprintf(stderr, "Read I/O failed, aborting run\n");
+		sequence->is_completed = 2;
+		exit(1);
+	}
+
+	/*
+	 * The read I/O has completed.  Print the contents of the
+	 *  buffer, free the buffer, then mark the sequence as
+	 *  completed.  This will trigger the hello_world() function
+	 *  to exit its polling loop.
+	 */
+	uint64_t* buf_64 = (uint64_t*)sequence->buf;
+	for(uint64_t i = 0; i < spdk_nvme_ns_get_sector_size(sequence->ns_entry->ns)/sizeof(uint64_t); ++i) {
+		if(buf_64[i] != 0) {
+			printf("u64 i: %lu 非零!\n", i);
+		}
+	}
+	printf("全零!\n");
+	spdk_free(sequence->buf);
+}
+
+static void
+write_zeros_complete(void *arg, const struct spdk_nvme_cpl *completion)
+{
+	struct hello_world_sequence	*sequence = arg;
+	struct ns_entry			*ns_entry = sequence->ns_entry;
+	int				rc;
+
+	/* See if an error occurred. If so, display information
+	 * about it, and set completion value so that I/O
+	 * caller is aware that an error occurred.
+	 */
+	if (spdk_nvme_cpl_is_error(completion)) {
+		spdk_nvme_qpair_print_completion(sequence->ns_entry->qpair, (struct spdk_nvme_cpl *)completion);
+		fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
+		fprintf(stderr, "Write I/O failed, aborting run\n");
+		fprintf(stderr, "Unsuppored write zeros\n");
+		sequence->is_completed = 2;
+		exit(1);
+	}
+	// 成功的时候没有任何输出
+	spdk_nvme_qpair_print_completion(sequence->ns_entry->qpair, (struct spdk_nvme_cpl *)completion);
+	/*
+	 * The write I/O has completed.  Free the buffer associated with
+	 *  the write I/O and allocate a new zeroed buffer for reading
+	 *  the data back from the NVMe namespace.
+	 */
+	if (sequence->using_cmb_io) {
+		spdk_nvme_ctrlr_unmap_cmb(ns_entry->ctrlr);
+	} else {
+		spdk_free(sequence->buf);
+	}
+	sequence->buf = spdk_zmalloc(0x1000, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+
+	rc = spdk_nvme_ns_cmd_read(ns_entry->ns, ns_entry->qpair, sequence->buf,
+				   0, /* LBA start */
+				   1, /* number of LBAs */
+				   read_zeros_complete, (void *)sequence, 0);
+	if (rc != 0) {
+		fprintf(stderr, "starting read I/O failed\n");
+		exit(1);
+	}
+}
+
+static void
 reset_zone_complete(void *arg, const struct spdk_nvme_cpl *completion)
 {
 	struct hello_world_sequence *sequence = arg;
@@ -315,6 +393,20 @@ hello_world(void)
 			spdk_nvme_qpair_process_completions(ns_entry->qpair, 0);
 		}
 
+		// my test
+		sequence.is_completed = 0;
+		rc = spdk_nvme_ns_cmd_write_zeroes(ns_entry->ns, ns_entry->qpair,
+					    0, /* LBA start */
+					    1, /* number of LBAs */
+					    write_zeros_complete, &sequence, 0);
+		if (rc != 0) {
+			fprintf(stderr, "write_zeroes I/O failed\n");
+			exit(1);
+		}
+		while (!sequence.is_completed) {
+			spdk_nvme_qpair_process_completions(ns_entry->qpair, 0);
+		}
+
 		/*
 		 * Free the I/O qpair.  This typically is done when an application exits.
 		 *  But SPDK does support freeing and then reallocating qpairs during
@@ -323,6 +415,199 @@ hello_world(void)
 		 */
 		spdk_nvme_ctrlr_free_io_qpair(ns_entry->qpair);
 	}
+}
+
+static void
+test_deallocate_common_complete(void *arg, const struct spdk_nvme_cpl *completion)
+{
+	struct hello_world_sequence	*sequence = arg;
+
+	/* See if an error occurred. If so, display information
+	 * about it, and set completion value so that I/O
+	 * caller is aware that an error occurred.
+	 */
+	if (spdk_nvme_cpl_is_error(completion)) {
+		spdk_nvme_qpair_print_completion(sequence->ns_entry->qpair, (struct spdk_nvme_cpl *)completion);
+		fprintf(stderr, "I/O error status: %s\n", spdk_nvme_cpl_get_status_string(&completion->status));
+		fprintf(stderr, "Write I/O failed, aborting run\n");
+		sequence->is_completed = 2;
+		exit(1);
+	}
+	sequence->is_completed = 1;
+}
+
+// 自添加
+static void
+test_deallocate(void)
+{
+	struct ns_entry			*ns_entry;
+	struct hello_world_sequence	sequence;
+	int				rc;
+	ns_entry = TAILQ_FIRST(&g_namespaces);
+	ns_entry->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns_entry->ctrlr, NULL, 0);
+	if (ns_entry->qpair == NULL) {
+		printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair() failed\n");
+		return;
+	}
+
+	const int LBA_NUM = 64;
+	const int START_LBA_FOR_DSM = 256;
+	const int START_LBA_FOR_RAW = START_LBA_FOR_DSM + LBA_NUM;
+	const int RANGE_NUM = 32;
+	const int LBA_LEVEL = LBA_NUM / RANGE_NUM;
+	int sector_size = spdk_nvme_ns_get_sector_size(ns_entry->ns);
+	size_t total_size = LBA_NUM * sector_size;
+
+	void* write_buf = spdk_zmalloc(total_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (write_buf == NULL) {
+		printf("ERROR: write buffer allocation failed\n");
+		return;
+	}
+	void* dsm_read_buf = spdk_zmalloc(total_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (dsm_read_buf == NULL) {
+		printf("ERROR: write buffer allocation failed\n");
+		return;
+	}
+	void* raw_read_buf = spdk_zmalloc(total_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (raw_read_buf == NULL) {
+		printf("ERROR: write buffer allocation failed\n");
+		return;
+	}
+
+	memset(write_buf, 1, total_size);
+	memset(dsm_read_buf, 2, total_size);
+	memset(raw_read_buf, 3, total_size);
+
+	strcpy((char*)write_buf, "TEST spdk_nvme_ctrlr_cmd_io_raw Deallocate!!!");
+
+	struct spdk_nvme_dsm_range* dsm_ranges = (struct spdk_nvme_dsm_range*)malloc(sizeof(struct spdk_nvme_dsm_range)*RANGE_NUM);
+	if (dsm_ranges == NULL) {
+		printf("ERROR: write buffer allocation failed\n");
+		return;
+	}
+	struct spdk_nvme_dsm_range* raw_ranges = spdk_zmalloc(0x1000, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (raw_ranges == NULL) {
+		printf("ERROR: write buffer allocation failed\n");
+		return;
+	}
+
+	// 首先写数据
+	sequence.is_completed = 0;
+	rc = spdk_nvme_ns_cmd_write(ns_entry->ns, ns_entry->qpair, write_buf,
+					    START_LBA_FOR_DSM, /* LBA start */
+					    LBA_NUM, /* number of LBAs */
+					    test_deallocate_common_complete, &sequence, 0);
+	if (rc != 0) {
+		fprintf(stderr, "starting write I/O failed\n");
+		exit(1);
+	}
+	while (!sequence.is_completed) {
+		spdk_nvme_qpair_process_completions(ns_entry->qpair, 0);
+	}
+	sequence.is_completed = 0;
+	rc = spdk_nvme_ns_cmd_write(ns_entry->ns, ns_entry->qpair, write_buf,
+					    START_LBA_FOR_RAW, /* LBA start */
+					    LBA_NUM, /* number of LBAs */
+					    test_deallocate_common_complete, &sequence, 0);
+	if (rc != 0) {
+		fprintf(stderr, "starting write I/O failed\n");
+		exit(1);
+	}
+	while (!sequence.is_completed) {
+		spdk_nvme_qpair_process_completions(ns_entry->qpair, 0);
+	}
+
+	// DSM释放数据
+	for(int i = 0; i < RANGE_NUM; ++i) {
+		dsm_ranges[i].attributes.raw = 0;
+		dsm_ranges[i].starting_lba = START_LBA_FOR_DSM + i * LBA_LEVEL;
+		dsm_ranges[i].length = LBA_LEVEL;
+	}
+	sequence.is_completed = 0;
+	rc = spdk_nvme_ns_cmd_dataset_management(ns_entry->ns, ns_entry->qpair,
+			SPDK_NVME_DSM_ATTR_DEALLOCATE, dsm_ranges, RANGE_NUM, test_deallocate_common_complete, &sequence);
+	if (rc) {
+		printf("Error in nvme command completion, values may be inaccurate.\n");
+	}
+	while (!sequence.is_completed) {
+		spdk_nvme_qpair_process_completions(ns_entry->qpair, 0);
+	}
+	printf("spdk_nvme_ns_cmd_dataset_management over\n");
+
+	// RAW 释放数据
+	for(int i = 0; i < RANGE_NUM; ++i) {
+		raw_ranges[i].attributes.raw = 0;
+		raw_ranges[i].starting_lba = START_LBA_FOR_RAW + i * LBA_LEVEL;
+		raw_ranges[i].length = LBA_LEVEL;
+	}
+	sequence.is_completed = 0;
+	struct spdk_nvme_cmd cmd = {0};
+	cmd.opc = SPDK_NVME_OPC_DATASET_MANAGEMENT;
+	cmd.nsid = spdk_nvme_ns_get_id(ns_entry->ns);
+	cmd.cdw10_bits.dsm.nr = RANGE_NUM - 1;
+	cmd.cdw11 = SPDK_NVME_DSM_ATTR_DEALLOCATE;
+	rc = spdk_nvme_ctrlr_cmd_io_raw(ns_entry->ctrlr, ns_entry->qpair, &cmd, raw_ranges,
+		LBA_NUM * sizeof(struct spdk_nvme_dsm_range), test_deallocate_common_complete, &sequence);
+	if (rc) {
+		printf("Error in nvme command completion, values may be inaccurate.\n");
+	}
+	while (!sequence.is_completed) {
+		spdk_nvme_qpair_process_completions(ns_entry->qpair, 0);
+	}
+	printf("spdk_nvme_ctrlr_cmd_io_raw over\n");
+
+	// 读出来 DSM
+	sequence.is_completed = 0;
+	rc = spdk_nvme_ns_cmd_read(ns_entry->ns, ns_entry->qpair, dsm_read_buf,
+				   START_LBA_FOR_DSM, /* LBA start */
+				   LBA_NUM, /* number of LBAs */
+				   test_deallocate_common_complete, &sequence, 0);
+	if (rc != 0) {
+		fprintf(stderr, "starting read I/O failed\n");
+		exit(1);
+	}
+	while (!sequence.is_completed) {
+		spdk_nvme_qpair_process_completions(ns_entry->qpair, 0);
+	}
+
+	// 读出来 RAW
+	sequence.is_completed = 0;
+	rc = spdk_nvme_ns_cmd_read(ns_entry->ns, ns_entry->qpair, raw_read_buf,
+				   START_LBA_FOR_RAW, /* LBA start */
+				   LBA_NUM, /* number of LBAs */
+				   test_deallocate_common_complete, &sequence, 0);
+	if (rc != 0) {
+		fprintf(stderr, "starting read I/O failed\n");
+		exit(1);
+	}
+	while (!sequence.is_completed) {
+		spdk_nvme_qpair_process_completions(ns_entry->qpair, 0);
+	}
+	if(memcmp(dsm_read_buf, raw_read_buf, total_size) == 0) {
+		printf("=== spdk_nvme_ctrlr_cmd_io_raw SUCCESS!\n");
+	} else {
+		printf("=== spdk_nvme_ctrlr_cmd_io_raw FAIL!\n");
+	}
+	if(memcmp(dsm_read_buf, write_buf, total_size) == 0) {
+		printf("=== deallocate read [EQUAL] write buf!\n");
+	} else {
+		printf("=== deallocate read [NOT EQUAL] write buf!\n");
+	}
+	printf("=== dsm_read_buf: %s\n", (char*)dsm_read_buf);
+	printf("=== raw_read_buf: %s\n", (char*)raw_read_buf);
+
+	spdk_free(raw_ranges);
+	spdk_free(write_buf);
+	spdk_free(dsm_read_buf);
+	spdk_free(raw_read_buf);
+
+	/*
+	 * Free the I/O qpair.  This typically is done when an application exits.
+	 *  But SPDK does support freeing and then reallocating qpairs during
+	 *  operation.  It is the responsibility of the caller to ensure all
+	 *  pending I/O are completed before trying to free the qpair.
+	 */
+	spdk_nvme_ctrlr_free_io_qpair(ns_entry->qpair);
 }
 
 static bool
@@ -556,6 +841,7 @@ int main(int argc, char **argv)
 
 	printf("Initialization complete.\n");
 	// 3. 执行与设备相关的读写操作
+	test_deallocate();
 	hello_world();
 	cleanup();
 	if (g_vmd) {

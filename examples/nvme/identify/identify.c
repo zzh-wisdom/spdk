@@ -965,12 +965,20 @@ print_namespace(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	       (flags & SPDK_NVME_NS_FLUSH_SUPPORTED) ? "Supported" : "Not Supported");
 	printf("Reservation:                           %s\n",
 	       (flags & SPDK_NVME_NS_RESERVATION_SUPPORTED) ? "Supported" : "Not Supported");
+	printf("WRITE_ZEROES:                          %s\n",
+	       (flags & SPDK_NVME_NS_WRITE_ZEROES_SUPPORTED) ? "Supported" : "Not Supported");
 	if (flags & SPDK_NVME_NS_DPS_PI_SUPPORTED) {
 		printf("End-to-End Data Protection:            Supported\n");
 		printf("Protection Type:                       Type%d\n", nsdata->dps.pit);
 		printf("Protection Information Transferred as: %s\n",
 		       nsdata->dps.md_start ? "First 8 Bytes" : "Last 8 Bytes");
 	}
+	printf("EXTENDED_LBA:                          %s\n",
+	       (flags & SPDK_NVME_NS_EXTENDED_LBA_SUPPORTED) ? "Supported" : "Not Supported");
+	printf("WRITE_UNCORRECTABLE:                   %s\n",
+	       (flags & SPDK_NVME_NS_WRITE_UNCORRECTABLE_SUPPORTED) ? "Supported" : "Not Supported");
+	printf("COMPARE:                               %s\n",
+	       (flags & SPDK_NVME_NS_COMPARE_SUPPORTED) ? "Supported" : "Not Supported");
 	if (nsdata->lbaf[nsdata->flbas.format].ms > 0) {
 		printf("Metadata Transferred as:               %s\n",
 		       nsdata->flbas.extended ? "Extended Data LBA" : "Separate Metadata Buffer");
@@ -1602,7 +1610,7 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 		for (i = 0; i < SPDK_COUNTOF(cmd_effects_log_page.io_cmds_supported); i++) {
 			struct spdk_nvme_cmds_and_effect_entry *cmd = &cmd_effects_log_page.io_cmds_supported[i];
 			if (cmd->csupp) {
-				printf("%30s (%02Xh): Supported %s%s%s%s%s\n",
+				printf("%30s (%02Xh): Supported %s%s%s%s%s (NULL)\n",
 				       io_opc_name(i), i,
 				       cmd->lbcc ? "LBA-Change " : "",
 				       cmd->ncc ? "NS-Cap-Change " : "",

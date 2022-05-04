@@ -1309,11 +1309,17 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	printf("\tsupports_extended_lba: %s\n", spdk_nvme_ns_supports_extended_lba(ns) ? "true" : "false");
 
 	if (spdk_nvme_ns_get_flags(ns) & SPDK_NVME_NS_DPS_PI_SUPPORTED) {
-		printf("[硬件特性]：设备【支持】数据端到端保护\n");
+		printf("\t设备【支持】数据端到端保护\n");
 		entry->io_flags = g_metacfg_pract_flag | g_metacfg_prchk_flags;
 	} else {
-		printf("[硬件特性]：设备【不支持】数据端到端保护\n");
+		printf("\t设备【不支持】数据端到端保护\n");
 	}
+	enum spdk_nvme_dealloc_logical_block_read_value read_value =
+		spdk_nvme_ns_get_dealloc_logical_block_read_value(ns);
+	const char* read_v_str = read_value == SPDK_NVME_DEALLOC_NOT_REPORTED ? "NOT_REPORTED" :
+		(read_value == SPDK_NVME_DEALLOC_READ_00 ? "READ_00" : "READ_FF");
+	printf("\tdealloc_logical_block_read_value: %s\n", read_v_str);
+	printf("\toptimal_io_boundary(LBA num): %u\n", spdk_nvme_ns_get_optimal_io_boundary(ns));
 
 	/* If metadata size = 8 bytes, PI is stripped (read) or inserted (write),
 	 *  and so reduce metadata size from block size（从块数据中减去元数据大小）.
@@ -2779,6 +2785,7 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		       pci_id.vendor_id, pci_id.device_id);
 	}
 
+	printf("memory_domains: %d\n", spdk_nvme_ctrlr_get_memory_domains(ctrlr, NULL, 0));
 	register_ctrlr(ctrlr, trid_entry);
 }
 

@@ -650,6 +650,7 @@ int spdk_nvme_transport_id_populate_trstring(struct spdk_nvme_transport_id *trid
 
 /**
  * Parse the string representation of a transport ID transport type.
+ * 根据str解析得到trtype，并通过trtype返回
  *
  * \param trtype Output transport type (allocated by caller).
  * \param str Input string representation of transport type (e.g. "PCIe", "RDMA").
@@ -950,6 +951,11 @@ struct spdk_nvme_probe_ctx *spdk_nvme_probe_async(const struct spdk_nvme_transpo
  * with the number of times where the user returned true for the
  * probe_cb.
  *
+ * 继续连接与探测器上下文关联的控制器。探测上下文是从上一个调用返回给 spdk_nvme_probe_async（） 的上下文。
+ * 用户必须在探测上下文中调用此函数，直到它返回 0。
+ * 如果任何控制器无法连接，则不会有显式通知。
+ * 用户可以通过将attach_cb调用与用户在probe_cb返回 true 的次数进行比较来检测附件失败。
+ *
  * \param probe_ctx Context used to track probe actions.
  *
  * \return 0 if all probe operations are complete; the probe_ctx
@@ -1030,6 +1036,11 @@ void spdk_nvme_detach_poll(struct spdk_nvme_detach_ctx *detach_ctx);
  *
  * This function also requires that the transport type and subnqn of the new trid
  * be the same as the old trid.
+ *
+ * 更新给定控制器的传输 ID。 此功能允许用户仅在控制器发生故障时为控制器设置新的 trid。
+ * 控制器的故障状态可以从 spdk_nvme_ctrlr_is_failed() 获得。
+ * 也可以使用 spdk_nvme_ctrlr_fail() 强制控制器进入故障状态。
+ * 此功能还要求新 trid 的传输类型和 subnqn 与旧 trid 相同。
  *
  * \param ctrlr Opaque handle to an NVMe controller.
  * \param trid The new transport ID.
